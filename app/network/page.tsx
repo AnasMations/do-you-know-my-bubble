@@ -14,17 +14,25 @@ interface NodeData {
   y?: number;
 }
 
-interface Node extends d3.SimulationNodeDatum, NodeData { }
+interface Node extends d3.SimulationNodeDatum, NodeData {}
 
 interface LinkData {
   source: string;
   target: string;
 }
 
+/** A bubble/group that wraps member nodes – drawn as a hull around them */
+interface BubbleGroup {
+  id: string;
+  name: string;
+  memberNodeIds: string[];
+}
+
 interface SavedBubble {
   name: string;
   nodes: NodeData[];
   links: LinkData[];
+  groups?: BubbleGroup[];
 }
 
 interface Link extends d3.SimulationLinkDatum<Node> {
@@ -37,12 +45,8 @@ function createNode(
   name: string,
   type: "user" | "connection"
 ): NodeData {
-  return {
-    id,
-    name,
-    type,
-    radius: type === "user" ? 35 : 22,
-  };
+  const radius = type === "user" ? 35 : 22;
+  return { id, name, type, radius };
 }
 
 export default function NetworkPage() {
@@ -58,11 +62,19 @@ export default function NetworkPage() {
   const [newConnectionName, setNewConnectionName] = useState("");
   const [isFrozen, setIsFrozen] = useState(false);
   const [linkFromNodeId, setLinkFromNodeId] = useState<string | null>(null);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [showAddGroupForm, setShowAddGroupForm] = useState(false);
+  const [groups, setGroups] = useState<BubbleGroup[]>([]);
+  const [addToGroupId, setAddToGroupId] = useState<string | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const svgRef = useRef<SVGSVGElement>(null);
+  const graphContainerRef = useRef<HTMLDivElement>(null);
   const simulationRef = useRef<d3.Simulation<Node, Link> | null>(null);
   const didDragRef = useRef(false);
   const nextIdRef = useRef(0);
+  const nextGroupIdRef = useRef(0);
   const hasFlushedPositionsRef = useRef(false);
+  const addToGroupIdRef = useRef<string | null>(null);
   const isFrozenRef = useRef(false);
   const linkFromNodeIdRef = useRef<string | null>(null);
 
@@ -79,8 +91,19 @@ export default function NetworkPage() {
         saved.nodes.length > 0
       ) {
         setName(saved.name);
-        setNodes(saved.nodes);
-        setLinks(saved.links);
+        // Migrate: drop old "group" nodes and links to/from them; load bubble groups
+        type SavedNode = NodeData | (Omit<NodeData, "type"> & { type: "group" });
+        const savedNodes = saved.nodes as SavedNode[];
+        const groupNodeIds = new Set(
+          savedNodes.filter((n): n is Omit<NodeData, "type"> & { type: "group" } => n.type === "group").map((n) => n.id)
+        );
+        setNodes(savedNodes.filter((n): n is NodeData => n.type !== "group"));
+        setLinks(
+          saved.links.filter(
+            (l) => !groupNodeIds.has(l.source) && !groupNodeIds.has(l.target)
+          )
+        );
+        setGroups(Array.isArray(saved.groups) ? saved.groups : []);
         setSubmitted(true);
         const maxConn = saved.nodes.reduce((max, n) => {
           if (n.id.startsWith("conn-")) {
@@ -90,6 +113,17 @@ export default function NetworkPage() {
           return max;
         }, -1);
         nextIdRef.current = maxConn + 1;
+        const maxGroup = (saved.groups ?? []).reduce(
+          (max, g) => {
+            if (g.id.startsWith("group-")) {
+              const num = parseInt(g.id.replace("group-", ""), 10);
+              return Math.max(max, isNaN(num) ? 0 : num);
+            }
+            return max;
+          },
+          -1
+        );
+        nextGroupIdRef.current = maxGroup + 1;
       }
     } catch {
       // ignore invalid or old data
@@ -99,13 +133,18 @@ export default function NetworkPage() {
   // Save bubble to localStorage whenever it changes
   useEffect(() => {
     if (!submitted || !name.trim() || nodes.length === 0) return;
-    const data: SavedBubble = { name: name.trim(), nodes, links };
+    const data: SavedBubble = {
+      name: name.trim(),
+      nodes,
+      links,
+      groups: groups.length > 0 ? groups : undefined,
+    };
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
     } catch {
       // ignore quota or other errors
     }
-  }, [submitted, name, nodes, links]);
+  }, [submitted, name, nodes, links, groups]);
 
   // Keep refs in sync so handlers inside effect can read current state
   useEffect(() => {
@@ -114,6 +153,17 @@ export default function NetworkPage() {
   useEffect(() => {
     linkFromNodeIdRef.current = linkFromNodeId;
   }, [linkFromNodeId]);
+  useEffect(() => {
+    addToGroupIdRef.current = addToGroupId;
+  }, [addToGroupId]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -162,17 +212,60 @@ export default function NetworkPage() {
     []
   );
 
-  // Only change when nodes/links are added or removed (not when only x,y change).
-  // This prevents the effect from re-running when we flush positions → no re-render loop.
+  const addGroup = useCallback((groupName: string) => {
+    const trimmed = groupName.trim();
+    if (!trimmed) return;
+    const newId = `group-${nextGroupIdRef.current++}`;
+    setGroups((prev) => [
+      ...prev,
+      { id: newId, name: trimmed, memberNodeIds: [] },
+    ]);
+    setNewGroupName("");
+    setShowAddGroupForm(false);
+    setAddToGroupId(newId); // enter "add nodes to group" mode
+  }, []);
+
+  const addNodeToGroup = useCallback((groupId: string, nodeId: string) => {
+    setGroups((prev) =>
+      prev.map((g) =>
+        g.id === groupId && !g.memberNodeIds.includes(nodeId)
+          ? { ...g, memberNodeIds: [...g.memberNodeIds, nodeId] }
+          : g
+      )
+    );
+  }, []);
+
+  const removeNodeFromGroup = useCallback((groupId: string, nodeId: string) => {
+    setGroups((prev) =>
+      prev.map((g) =>
+        g.id === groupId
+          ? {
+              ...g,
+              memberNodeIds: g.memberNodeIds.filter((id) => id !== nodeId),
+            }
+          : g
+      )
+    );
+  }, []);
+
+  const handleAddGroupSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    addGroup(newGroupName);
+  };
+
   const nodeIdsKey =
     nodes.length + "-" + [...nodes.map((n) => n.id)].sort().join(",");
   const linksKey =
     links.length +
     "-" +
     [...links.map((l) => `${l.source}-${l.target}`)].sort().join(",");
+  const groupsKey =
+    groups.length +
+    "-" +
+    [...groups.map((g) => g.id)].sort().join(",");
   const graphStructure = useMemo(
-    () => ({ nodeIdsKey, linksKey }),
-    [nodeIdsKey, linksKey]
+    () => ({ nodeIdsKey, linksKey, groupsKey }),
+    [nodeIdsKey, linksKey, groupsKey]
   );
 
   useEffect(() => {
@@ -239,6 +332,21 @@ export default function NetworkPage() {
 
     simulationRef.current = simulation;
 
+    // Bubble groups (drawn behind links and nodes) – hulls around member nodes
+    const bubbleGroupsG = container
+      .append("g")
+      .attr("class", "bubble-groups")
+      .lower();
+    const groupPaths = bubbleGroupsG
+      .selectAll<SVGPathElement, BubbleGroup>("path")
+      .data(groups, (d) => d.id)
+      .join("path")
+      .attr("fill", "rgba(167, 139, 250, 0.25)")
+      .attr("stroke", "#7c3aed")
+      .attr("stroke-width", 2)
+      .attr("stroke-dasharray", "6 4")
+      .attr("pointer-events", "none");
+
     // Create SVG elements
     const link = container
       .append("g")
@@ -281,6 +389,10 @@ export default function NetworkPage() {
     node.on("click", (event, d) => {
       event.stopPropagation();
       if (!didDragRef.current && svgRef.current) {
+        if (addToGroupIdRef.current) {
+          addNodeToGroup(addToGroupIdRef.current, d.id);
+          return;
+        }
         if (linkFromNodeIdRef.current) {
           addLinkBetweenNodes(linkFromNodeIdRef.current, d.id);
           return;
@@ -295,21 +407,18 @@ export default function NetworkPage() {
       }
     });
 
-    // Add circles for nodes with gradient
+    // Add circles for nodes
     node
       .append("circle")
       .attr("r", (d) => d.radius)
-      .attr("fill", (d) => {
-        if (d.type === "user") {
-          return "#3b82f6"; // Blue for user
-        }
-        return "#10b981"; // Green for connections
-      })
+      .attr("fill", (d) =>
+        d.type === "user" ? "#3b82f6" : "#10b981"
+      )
       .attr("stroke", "#fff")
       .attr("stroke-width", 3)
       .style("filter", "drop-shadow(0 2px 4px rgba(0,0,0,0.2))");
 
-    // Add labels with better styling
+    // Add labels
     node
       .append("text")
       .text((d) => d.name)
@@ -329,7 +438,6 @@ export default function NetworkPage() {
           .duration(200)
           .attr("r", d.radius * 1.2)
           .attr("stroke-width", 4);
-
         d3.select(this)
           .select("text")
           .transition()
@@ -343,7 +451,6 @@ export default function NetworkPage() {
           .duration(200)
           .attr("r", d.radius)
           .attr("stroke-width", 3);
-
         d3.select(this)
           .select("text")
           .transition()
@@ -355,6 +462,34 @@ export default function NetworkPage() {
 
     // Update positions on simulation tick
     simulation.on("tick", () => {
+      // Update bubble group hulls from member node positions
+      groupPaths.each(function (group: BubbleGroup) {
+        const points: [number, number][] = [];
+        group.memberNodeIds.forEach((id) => {
+          const n = nodesData.find((nn) => nn.id === id);
+          if (n && n.x != null && n.y != null)
+            points.push([n.x as number, n.y as number]);
+        });
+        let d = "";
+        if (points.length >= 3) {
+          const hull = d3.polygonHull(points);
+          if (hull) d = "M" + hull.map((p) => p.join(",")).join("L") + "Z";
+        } else if (points.length === 2) {
+          const [[x1, y1], [x2, y2]] = points;
+          const cx = (x1 + x2) / 2;
+          const cy = (y1 + y2) / 2;
+          const r = Math.hypot(x2 - x1, y2 - y1) / 2 + 45;
+          d = `M${cx + r},${cy} A${r},${r} 0 0 1 ${cx - r},${cy} A${r},${r} 0 0 1 ${cx + r},${cy}Z`;
+        } else if (points.length === 1) {
+          const [x, y] = points[0];
+          const r = 50;
+          d = `M${x + r},${y} A${r},${r} 0 0 1 ${x - r},${y} A${r},${r} 0 0 1 ${x + r},${y}Z`;
+        }
+        d3.select(this)
+          .attr("d", d)
+          .attr("visibility", d ? "visible" : "hidden");
+      });
+
       link
         .attr("x1", (d) => (d.source as Node).x!)
         .attr("y1", (d) => (d.source as Node).y!)
@@ -475,7 +610,7 @@ export default function NetworkPage() {
     // Intentionally depend only on graphStructure (not nodes/links) so that
     // flushing positions to state doesn't re-run this effect and cause a loop.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [submitted, name, graphStructure, addLinkBetweenNodes]);
+  }, [submitted, name, graphStructure, addLinkBetweenNodes, addNodeToGroup]);
 
   if (!submitted) {
     return (
@@ -525,7 +660,28 @@ export default function NetworkPage() {
           Drag nodes to rearrange • Scroll to zoom • Click and drag to pan •
           Click a bubble to add connections to it
         </p>
-        <div className="flex gap-2">
+      </div>
+      <div
+        ref={graphContainerRef}
+        className="flex-1 relative border-2 border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden bg-gray-50 dark:bg-gray-900 min-h-0"
+      >
+        <div
+          className="absolute top-3 right-3 z-20 flex flex-col gap-2 p-2 rounded-lg bg-white/90 dark:bg-gray-800/90 shadow-lg border border-gray-200 dark:border-gray-600"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={async () => {
+              if (isFullscreen) {
+                await document.exitFullscreen();
+              } else if (graphContainerRef.current) {
+                await graphContainerRef.current.requestFullscreen();
+              }
+            }}
+            className="px-4 py-2 bg-slate-600 hover:bg-slate-700 text-white font-medium rounded-lg transition-colors text-sm whitespace-nowrap"
+          >
+            {isFullscreen ? "Exit full screen" : "Full screen"}
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -539,7 +695,7 @@ export default function NetworkPage() {
               }
             }}
             disabled={isFrozen}
-            className="px-4 py-2 bg-slate-500 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors"
+            className="px-4 py-2 bg-slate-500 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors text-sm whitespace-nowrap"
           >
             Freeze layout
           </button>
@@ -556,13 +712,52 @@ export default function NetworkPage() {
               }
             }}
             disabled={!isFrozen}
-            className="px-4 py-2 bg-slate-500 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors"
+            className="px-4 py-2 bg-slate-500 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors text-sm whitespace-nowrap"
           >
             Unfreeze layout
           </button>
+          {showAddGroupForm ? (
+            <form
+              onSubmit={(e) => handleAddGroupSubmit(e)}
+              className="flex flex-col gap-2"
+            >
+              <input
+                type="text"
+                value={newGroupName}
+                onChange={(e) => setNewGroupName(e.target.value)}
+                placeholder="Group name (e.g. Family, Work)"
+                className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 dark:bg-gray-800 dark:text-white text-sm w-40"
+                autoFocus
+              />
+              <div className="flex gap-1">
+                <button
+                  type="submit"
+                  className="flex-1 px-3 py-2 bg-violet-500 hover:bg-violet-600 text-white font-medium rounded-lg transition-colors text-sm"
+                >
+                  Add
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAddGroupForm(false);
+                    setNewGroupName("");
+                  }}
+                  className="px-3 py-2 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowAddGroupForm(true)}
+              className="px-4 py-2 bg-violet-500 hover:bg-violet-600 text-white font-medium rounded-lg transition-colors text-sm whitespace-nowrap"
+            >
+              Add group
+            </button>
+          )}
         </div>
-      </div>
-      <div className="flex-1 relative border-2 border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden bg-gray-50 dark:bg-gray-900 min-h-0">
         <svg
           ref={svgRef}
           width="100%"
@@ -573,11 +768,12 @@ export default function NetworkPage() {
             setPopupPosition(null);
             setNewConnectionName("");
             setLinkFromNodeId(null);
+            setAddToGroupId(null);
           }}
         />
         {selectedNode && popupPosition && (
           <div
-            className="absolute z-10 w-72 p-4 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 shadow-lg"
+            className="absolute z-30 w-72 p-4 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-600 shadow-lg"
             style={{
               left: popupPosition.x + selectedNode.radius + 12,
               top: popupPosition.y,
@@ -613,6 +809,47 @@ export default function NetworkPage() {
                 </button>
               </div>
             </form>
+            <div className="mt-2 pt-2 border-t border-gray-200 dark:border-gray-600">
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+                Add <strong>{selectedNode.name}</strong> to a group
+              </p>
+              <div className="flex flex-wrap gap-1">
+                {groups
+                  .filter((g) => !g.memberNodeIds.includes(selectedNodeId!))
+                  .map((g) => (
+                    <button
+                      key={g.id}
+                      type="button"
+                      onClick={() => {
+                        addNodeToGroup(g.id, selectedNodeId!);
+                      }}
+                      className="px-2 py-1 text-xs bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300 rounded hover:bg-violet-200 dark:hover:bg-violet-800/50"
+                    >
+                      + {g.name}
+                    </button>
+                  ))}
+                {groups
+                  .filter((g) => g.memberNodeIds.includes(selectedNodeId!))
+                  .map((g) => (
+                    <button
+                      key={g.id}
+                      type="button"
+                      onClick={() =>
+                        removeNodeFromGroup(g.id, selectedNodeId!)
+                      }
+                      className="px-2 py-1 text-xs bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 rounded hover:bg-slate-300 dark:hover:bg-slate-600"
+                    >
+                      − {g.name}
+                    </button>
+                  ))}
+                {groups.length === 0 && (
+                  <span className="text-xs text-gray-500">
+                    Add a group from the header first, then click nodes to add
+                    them.
+                  </span>
+                )}
+              </div>
+            </div>
             <button
               type="button"
               onClick={() => {
@@ -652,6 +889,23 @@ export default function NetworkPage() {
               className="px-3 py-1 text-sm bg-amber-200 dark:bg-amber-800 hover:bg-amber-300 dark:hover:bg-amber-700 rounded transition-colors"
             >
               Cancel
+            </button>
+          </div>
+        )}
+        {addToGroupId && (
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 px-4 py-2 bg-violet-100 dark:bg-violet-900/40 border border-violet-300 dark:border-violet-700 rounded-lg shadow flex items-center gap-3">
+            <span className="text-sm text-violet-800 dark:text-violet-200">
+              Click nodes to add them to{" "}
+              <strong>
+                {groups.find((g) => g.id === addToGroupId)?.name ?? "group"}
+              </strong>
+            </span>
+            <button
+              type="button"
+              onClick={() => setAddToGroupId(null)}
+              className="px-3 py-1 text-sm bg-violet-200 dark:bg-violet-800 hover:bg-violet-300 dark:hover:bg-violet-700 rounded transition-colors"
+            >
+              Done
             </button>
           </div>
         )}
